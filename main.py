@@ -30,7 +30,7 @@ from huggingface_hub import HfApi, hf_hub_download
 HF_DATASET = "HuggingFaceFW/fineweb"
 HF_TEXT_KEY = "text"
 
-ROWS_PER_RUN = 500_000   # Safe for CI
+ROWS_PER_RUN = 350_000   # Safe for CI
 
 TOKENIZER_PATH = "tokenizer.model"
 HF_REPO_ID = "anisoleai/fineweb-tokenized"
@@ -212,5 +212,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
