@@ -1,262 +1,193 @@
 """
-preprocessing.py  —  Standalone FineWeb Preprocessing Pipeline
-================================================================
+FineWeb → Tokenize → Push to HuggingFace
 
-Environment variable required:
-    HF_TOKEN=<your_huggingface_token>
+Requires:
+    HF_TOKEN environment variable
 
-Install deps:
-    pip install datasets sentencepiece tqdm numpy pyarrow huggingface_hub
-
-Run:
-    export HF_TOKEN=your_token
-    python preprocessing.py
+Compatible with:
+    datasets==4.6.1
+    huggingface_hub==1.5.0
 """
 
-# ==============================================================================
-# IMPORTS
-# ==============================================================================
-
 import os
-import sys
 import tempfile
 import numpy as np
 import pyarrow as pa
 import sentencepiece as spm
 from tqdm import tqdm
-from datasets import load_dataset as hf_load_dataset, Dataset
+from datasets import load_dataset, Dataset
 from huggingface_hub import HfApi
 
-# ==============================================================================
+
+# ==========================================================
 # CONFIG
-# ==============================================================================
+# ==========================================================
 
-CONFIG = {
-    "hf_dataset":       "HuggingFaceFW/fineweb",
-    "hf_text_key":      "text",
-    "rows_to_download": 5,
+HF_DATASET = "HuggingFaceFW/fineweb"
+HF_TEXT_KEY = "text"
+ROWS_TO_DOWNLOAD = 5
 
-    "raw_dir":          "raw",
-    "raw_file":         "raw/fineweb.txt",
-    "tokenizer_path":   "tokenizer.model",
+RAW_FILE = "raw.txt"
+TOKENIZER_PATH = "tokenizer.model"
 
-    "token_dtype":      np.uint16,
-    "shard_size":       1_000_000_000,
-    "split_doc":        True,
-    "min_doc_chars":    200,
+HF_REPO_ID = "anisoleai/fineweb-tokenized"
 
-    "hf_repo_id":       "anisoleai/fineweb-tokenized",
-    "push_to_hub":      True,
-}
-
-# ==============================================================================
-# UTIL
-# ==============================================================================
-
-def _banner(title: str):
-    bar = "=" * 70
-    print(f"\n{bar}\n  {title}\n{bar}\n")
+TOKEN_DTYPE = np.uint16
+MIN_DOC_CHARS = 200
+SPLIT_DOC = True
 
 
-# ==============================================================================
-# STEP 1 — DOWNLOAD
-# ==============================================================================
+# ==========================================================
+# DOWNLOAD
+# ==========================================================
 
-def download_fineweb(hf_dataset, text_key, output_path, rows_to_download, hf_token):
+def download_data():
 
-    print(f"Streaming from: {hf_dataset}")
-    ds = hf_load_dataset(hf_dataset, split="train", streaming=True, token=hf_token)
+    print("STEP 1 — DOWNLOAD")
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    ds = load_dataset(
+        HF_DATASET,
+        split="train",
+        streaming=True,
+        token=os.getenv("HF_TOKEN"),
+    )
 
-    written = 0
-    with open(output_path, "w", encoding="utf-8") as f:
-        for sample in tqdm(ds.take(rows_to_download), total=rows_to_download):
-            text = sample.get(text_key, "")
+    with open(RAW_FILE, "w", encoding="utf-8") as f:
+        for sample in tqdm(ds.take(ROWS_TO_DOWNLOAD), total=ROWS_TO_DOWNLOAD):
+            text = sample.get(HF_TEXT_KEY, "")
             if text:
                 f.write(text.strip() + "\n\n")
-                written += 1
 
-    print(f"✔ Downloaded {written} rows")
+    print("✔ Download complete\n")
 
 
-# ==============================================================================
-# STEP 2 — TOKENIZER
-# ==============================================================================
+# ==========================================================
+# LOAD TOKENIZER
+# ==========================================================
 
-def load_tokenizer(path):
+def load_tokenizer():
 
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Tokenizer not found at {path}. "
-            "Place tokenizer.model in project root."
-        )
+    print("STEP 2 — LOAD TOKENIZER")
 
-    sp = spm.SentencePieceProcessor(model_file=path)
-    print(f"✔ Tokenizer loaded (vocab size: {sp.get_piece_size():,})")
+    if not os.path.exists(TOKENIZER_PATH):
+        raise FileNotFoundError("tokenizer.model not found")
+
+    sp = spm.SentencePieceProcessor(model_file=TOKENIZER_PATH)
+    print(f"✔ Loaded tokenizer (vocab size: {sp.get_piece_size():,})\n")
     return sp
 
 
-# ==============================================================================
-# STEP 3 — ENCODE TO BINARY
-# ==============================================================================
+# ==========================================================
+# ENCODE
+# ==========================================================
 
-def encode_to_bin(corpus_path, tok, dtype, tmp_path, split_doc=True, min_doc_chars=200):
+def encode_corpus(sp):
 
-    total = 0
-    bos = tok.bos_id() if split_doc else None
-    eos = tok.eos_id() if split_doc else None
+    print("STEP 3 — ENCODE")
 
-    with open(corpus_path, "r", encoding="utf-8") as src, \
-         open(tmp_path, "wb") as dst:
+    bos = sp.bos_id()
+    eos = sp.eos_id()
 
-        buffer = src.read()
+    all_tokens = []
 
-        docs = buffer.split("\n\n") if split_doc else [buffer]
+    with open(RAW_FILE, "r", encoding="utf-8") as f:
+        text = f.read()
 
-        for doc in tqdm(docs):
-            doc = doc.strip()
-            if len(doc) < min_doc_chars:
-                continue
+    docs = text.split("\n\n") if SPLIT_DOC else [text]
 
-            tokens = []
-            if split_doc and bos is not None:
-                tokens.append(bos)
+    for doc in tqdm(docs):
+        doc = doc.strip()
+        if len(doc) < MIN_DOC_CHARS:
+            continue
 
-            tokens.extend(tok.encode(doc, out_type=int))
+        tokens = []
 
-            if split_doc and eos is not None:
-                tokens.append(eos)
+        if SPLIT_DOC and bos >= 0:
+            tokens.append(bos)
 
-            arr = np.array(tokens, dtype=dtype)
-            arr.tofile(dst)
-            total += len(arr)
+        tokens.extend(sp.encode(doc, out_type=int))
 
-    return total
+        if SPLIT_DOC and eos >= 0:
+            tokens.append(eos)
 
+        all_tokens.extend(tokens)
 
-# ==============================================================================
-# STEP 4 — PUSH SHARDS
-# ==============================================================================
+    arr = np.array(all_tokens, dtype=TOKEN_DTYPE)
 
-def push_from_bin(tmp_path, total_tokens, shard_size, dtype, repo_id, hf_token):
-
-    shard_index = 1
-    pushed = 0
-
-    with open(tmp_path, "rb") as f:
-
-        while pushed < total_tokens:
-
-            count = min(shard_size, total_tokens - pushed)
-            arr = np.fromfile(f, dtype=dtype, count=count)
-
-            if arr.size == 0:
-                break
-
-            pa_col = pa.array(arr, type=pa.uint16())
-            table = pa.table({"token_ids": pa_col})
-            ds = Dataset(table)
-
-            print(f"Pushing shard {shard_index} ({len(arr):,} tokens)")
-
-            ds.push_to_hub(
-                repo_id,
-                split="shard",
-                token=hf_token,
-                private=False,
-                append=True if shard_index > 1 else False,
-            )
-
-            pushed += arr.size
-            shard_index += 1
-
-    print(f"✔ Pushed {total_tokens:,} tokens")
+    print(f"✔ Encoded {len(arr):,} tokens\n")
+    return arr
 
 
-# ==============================================================================
-# MAIN PIPELINE
-# ==============================================================================
+# ==========================================================
+# PUSH TO HUB
+# ==========================================================
 
-def run_pipeline(cfg=CONFIG):
+def push_dataset(arr):
+
+    print("STEP 4 — PUSH")
 
     hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        raise EnvironmentError("HF_TOKEN not set")
 
-    if not hf_token and cfg["push_to_hub"]:
-        raise EnvironmentError(
-            "HF_TOKEN not found in environment variables.\n"
-            "Set it before running:\n"
-            "  export HF_TOKEN=your_token (Linux/macOS)\n"
-            "  set HF_TOKEN=your_token (Windows)\n"
-            "Or use GitHub Actions secrets."
-        )
+    # Create dataset
+    pa_array = pa.array(arr, type=pa.uint16())
+    table = pa.table({"token_ids": pa_array})
+    ds = Dataset(table)
 
-    _banner("STEP 1 — DOWNLOAD")
-    download_fineweb(
-        cfg["hf_dataset"],
-        cfg["hf_text_key"],
-        cfg["raw_file"],
-        cfg["rows_to_download"],
-        hf_token,
+    print("Uploading dataset split 'shard'...")
+    ds.push_to_hub(
+        HF_REPO_ID,
+        split="shard",
+        token=hf_token,
+        private=False,
     )
 
-    _banner("STEP 2 — LOAD TOKENIZER")
-    tok = load_tokenizer(cfg["tokenizer_path"])
+    print("✔ Dataset uploaded")
 
-    _banner("STEP 3 — ENCODE")
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bin")
-    os.close(tmp_fd)
+    # Upload tokenizer + README
+    api = HfApi()
 
-    try:
-        total_tokens = encode_to_bin(
-            cfg["raw_file"],
-            tok,
-            cfg["token_dtype"],
-            tmp_path,
-            cfg["split_doc"],
-            cfg["min_doc_chars"],
+    if os.path.exists(TOKENIZER_PATH):
+        api.upload_file(
+            path_or_fileobj=TOKENIZER_PATH,
+            path_in_repo="tokenizer.model",
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+            token=hf_token,
+        )
+        print("✔ tokenizer.model uploaded")
+
+    if os.path.exists("README.md"):
+        api.upload_file(
+            path_or_fileobj="README.md",
+            path_in_repo="README.md",
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+            token=hf_token,
+        )
+        print("✔ README uploaded")
+
+    print("\n🚀 Push complete\n")
+
+
+# ==========================================================
+# MAIN
+# ==========================================================
+
+def main():
+
+    if not os.getenv("HF_TOKEN"):
+        raise EnvironmentError(
+            "HF_TOKEN missing.\n"
+            "Set it locally or via GitHub Actions secrets."
         )
 
-        _banner("STEP 4 — PUSH")
-        if cfg["push_to_hub"]:
-            push_from_bin(
-                tmp_path,
-                total_tokens,
-                cfg["shard_size"],
-                cfg["token_dtype"],
-                cfg["hf_repo_id"],
-                hf_token,
-            )
-
-        # Upload tokenizer + README
-        api = HfApi()
-
-        if os.path.exists(cfg["tokenizer_path"]):
-            api.upload_file(
-                path_or_fileobj=cfg["tokenizer_path"],
-                path_in_repo="tokenizer.model",
-                repo_id=cfg["hf_repo_id"],
-                repo_type="dataset",
-                token=hf_token,
-            )
-
-        if os.path.exists("README.md"):
-            api.upload_file(
-                path_or_fileobj="README.md",
-                path_in_repo="README.md",
-                repo_id=cfg["hf_repo_id"],
-                repo_type="dataset",
-                token=hf_token,
-            )
-
-        print("✔ Metadata uploaded")
-
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-    _banner("PIPELINE COMPLETE")
+    download_data()
+    sp = load_tokenizer()
+    arr = encode_corpus(sp)
+    push_dataset(arr)
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    main()
