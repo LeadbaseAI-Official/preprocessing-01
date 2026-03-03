@@ -1,22 +1,26 @@
 """
-FineWeb → Tokenize → Push to HuggingFace
+Incremental FineWeb → Tokenize → Push (CI Safe)
 
-Requires:
-    HF_TOKEN environment variable
+State stored on HuggingFace:
+    progress.json
 
-Compatible with:
-    datasets==4.6.1
-    huggingface_hub==1.5.0
+Each run:
+    1. Reads progress.json
+    2. Downloads next chunk
+    3. Tokenizes
+    4. Uploads new shard parquet
+    5. Updates progress.json
 """
 
 import os
-import tempfile
+import json
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 import sentencepiece as spm
 from tqdm import tqdm
-from datasets import load_dataset, Dataset
-from huggingface_hub import HfApi
+from datasets import load_dataset
+from huggingface_hub import HfApi, hf_hub_download
 
 
 # ==========================================================
@@ -25,11 +29,10 @@ from huggingface_hub import HfApi
 
 HF_DATASET = "HuggingFaceFW/fineweb"
 HF_TEXT_KEY = "text"
-ROWS_TO_DOWNLOAD = 500_000
 
-RAW_FILE = "raw.txt"
+ROWS_PER_RUN = 180_000   # Safe for CI
+
 TOKENIZER_PATH = "tokenizer.model"
-
 HF_REPO_ID = "anisoleai/fineweb-tokenized"
 
 TOKEN_DTYPE = np.uint16
@@ -38,65 +41,88 @@ SPLIT_DOC = True
 
 
 # ==========================================================
-# DOWNLOAD
+# PROGRESS HANDLING
 # ==========================================================
 
-def download_data():
+def load_progress(api, token):
 
-    print("STEP 1 — DOWNLOAD")
+    try:
+        path = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename="progress.json",
+            repo_type="dataset",
+            token=token,
+        )
+        with open(path, "r") as f:
+            data = json.load(f)
+            return data.get("last_index", 0), data.get("shard_index", 1)
+    except Exception:
+        return 0, 1
+
+
+def save_progress(api, token, last_index, shard_index):
+
+    progress = {
+        "last_index": last_index,
+        "shard_index": shard_index
+    }
+
+    with open("progress.json", "w") as f:
+        json.dump(progress, f)
+
+    api.upload_file(
+        path_or_fileobj="progress.json",
+        path_in_repo="progress.json",
+        repo_id=HF_REPO_ID,
+        repo_type="dataset",
+        token=token,
+    )
+
+
+# ==========================================================
+# DOWNLOAD NEXT CHUNK
+# ==========================================================
+
+def download_chunk(start_index, token):
 
     ds = load_dataset(
         HF_DATASET,
         split="train",
         streaming=True,
-        token=os.getenv("HF_TOKEN"),
+        token=token,
     )
 
-    with open(RAW_FILE, "w", encoding="utf-8") as f:
-        for sample in tqdm(ds.take(ROWS_TO_DOWNLOAD), total=ROWS_TO_DOWNLOAD):
-            text = sample.get(HF_TEXT_KEY, "")
-            if text:
-                f.write(text.strip() + "\n\n")
+    ds = ds.skip(start_index)
 
-    print("✔ Download complete\n")
+    texts = []
+    count = 0
+
+    for sample in tqdm(ds.take(ROWS_PER_RUN), total=ROWS_PER_RUN):
+        text = sample.get(HF_TEXT_KEY, "")
+        if text:
+            texts.append(text.strip())
+            count += 1
+
+    return texts, count
 
 
 # ==========================================================
-# LOAD TOKENIZER
+# TOKENIZE
 # ==========================================================
 
-def load_tokenizer():
-
-    print("STEP 2 — LOAD TOKENIZER")
+def tokenize_texts(texts):
 
     if not os.path.exists(TOKENIZER_PATH):
-        raise FileNotFoundError("tokenizer.model not found")
+        raise FileNotFoundError("tokenizer.model missing")
 
     sp = spm.SentencePieceProcessor(model_file=TOKENIZER_PATH)
-    print(f"✔ Loaded tokenizer (vocab size: {sp.get_piece_size():,})\n")
-    return sp
-
-
-# ==========================================================
-# ENCODE
-# ==========================================================
-
-def encode_corpus(sp):
-
-    print("STEP 3 — ENCODE")
 
     bos = sp.bos_id()
     eos = sp.eos_id()
 
     all_tokens = []
 
-    with open(RAW_FILE, "r", encoding="utf-8") as f:
-        text = f.read()
-
-    docs = text.split("\n\n") if SPLIT_DOC else [text]
-
-    for doc in tqdm(docs):
-        doc = doc.strip()
+    for doc in tqdm(texts):
         if len(doc) < MIN_DOC_CHARS:
             continue
 
@@ -112,63 +138,34 @@ def encode_corpus(sp):
 
         all_tokens.extend(tokens)
 
-    arr = np.array(all_tokens, dtype=TOKEN_DTYPE)
-
-    print(f"✔ Encoded {len(arr):,} tokens\n")
-    return arr
+    return np.array(all_tokens, dtype=TOKEN_DTYPE)
 
 
 # ==========================================================
-# PUSH TO HUB
+# UPLOAD SHARD
 # ==========================================================
 
-def push_dataset(arr):
+def upload_shard(arr, shard_index, api, token):
 
-    print("STEP 4 — PUSH")
+    if len(arr) == 0:
+        print("No tokens generated. Skipping upload.")
+        return
 
-    hf_token = os.getenv("HF_TOKEN")
-    if not hf_token:
-        raise EnvironmentError("HF_TOKEN not set")
+    table = pa.table({"token_ids": pa.array(arr, type=pa.uint16())})
 
-    # Create dataset
-    pa_array = pa.array(arr, type=pa.uint16())
-    table = pa.table({"token_ids": pa_array})
-    ds = Dataset(table)
+    shard_name = f"data/shard-{shard_index:05d}.parquet"
 
-    print("Uploading dataset split 'shard'...")
-    ds.push_to_hub(
-        HF_REPO_ID,
-        split="shard",
-        token=hf_token,
-        private=False,
+    pq.write_table(table, "temp.parquet")
+
+    api.upload_file(
+        path_or_fileobj="temp.parquet",
+        path_in_repo=shard_name,
+        repo_id=HF_REPO_ID,
+        repo_type="dataset",
+        token=token,
     )
 
-    print("✔ Dataset uploaded")
-
-    # Upload tokenizer + README
-    api = HfApi()
-
-    if os.path.exists(TOKENIZER_PATH):
-        api.upload_file(
-            path_or_fileobj=TOKENIZER_PATH,
-            path_in_repo="tokenizer.model",
-            repo_id=HF_REPO_ID,
-            repo_type="dataset",
-            token=hf_token,
-        )
-        print("✔ tokenizer.model uploaded")
-
-    if os.path.exists("README.md"):
-        api.upload_file(
-            path_or_fileobj="README.md",
-            path_in_repo="README.md",
-            repo_id=HF_REPO_ID,
-            repo_type="dataset",
-            token=hf_token,
-        )
-        print("✔ README uploaded")
-
-    print("\n🚀 Push complete\n")
+    print(f"Uploaded shard {shard_index}")
 
 
 # ==========================================================
@@ -177,18 +174,41 @@ def push_dataset(arr):
 
 def main():
 
-    if not os.getenv("HF_TOKEN"):
-        raise EnvironmentError(
-            "HF_TOKEN missing.\n"
-            "Set it locally or via GitHub Actions secrets."
-        )
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        raise EnvironmentError("HF_TOKEN not set")
 
-    download_data()
-    sp = load_tokenizer()
-    arr = encode_corpus(sp)
-    push_dataset(arr)
+    api = HfApi()
+
+    print("Loading progress...")
+    last_index, shard_index = load_progress(api, hf_token)
+
+    print(f"Resuming from index: {last_index}")
+    print(f"Next shard index: {shard_index}")
+
+    print("Downloading next chunk...")
+    texts, downloaded = download_chunk(last_index, hf_token)
+
+    if downloaded == 0:
+        print("No new data available.")
+        return
+
+    print("Tokenizing...")
+    arr = tokenize_texts(texts)
+
+    print("Uploading shard...")
+    upload_shard(arr, shard_index, api, hf_token)
+
+    print("Updating progress...")
+    save_progress(
+        api,
+        hf_token,
+        last_index + downloaded,
+        shard_index + 1
+    )
+
+    print("Run complete.")
 
 
 if __name__ == "__main__":
     main()
-
