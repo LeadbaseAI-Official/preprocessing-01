@@ -2,8 +2,8 @@ name: Preprocess Pipeline
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # Runs every 2 hours
-  workflow_dispatch:        # Allows manual trigger
+    - cron: "*/15 * * * *"   # Runs every 15 minutes
+  workflow_dispatch:
 
 jobs:
   preprocess:
@@ -12,8 +12,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run preprocessing
         run: python main.py
