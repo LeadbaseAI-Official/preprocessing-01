@@ -16,6 +16,6 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run preprocessing
-        run: python preprocessing.py
+        run: python main.py
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
