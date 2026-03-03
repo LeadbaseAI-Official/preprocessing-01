@@ -25,7 +25,7 @@ from huggingface_hub import HfApi
 
 HF_DATASET = "HuggingFaceFW/fineweb"
 HF_TEXT_KEY = "text"
-ROWS_TO_DOWNLOAD = 5
+ROWS_TO_DOWNLOAD = 500_000
 
 RAW_FILE = "raw.txt"
 TOKENIZER_PATH = "tokenizer.model"
@@ -191,3 +191,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
