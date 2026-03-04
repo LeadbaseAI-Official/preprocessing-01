@@ -19,14 +19,14 @@ HF_TEXT_KEY = "text"
 ROWS_PER_RUN = 350_000
 SHARDS_PER_WORKER = 1500
 
-ROWS_PER_WORKER = ROWS_PER_RUN * SHARDS_PER_WORKER  # 525M rows per worker
-
 TOKENIZER_PATH = "tokenizer.model"
 HF_REPO_ID = "anisoleai/fineweb-tokenized"
 
 TOKEN_DTYPE = np.uint16
 MIN_DOC_CHARS = 200
 SPLIT_DOC = True
+
+TOTAL_WORKERS = 20
 
 
 # ==========================================================
@@ -37,18 +37,6 @@ WORKER_ID = int(os.getenv("WORKER_ID", "1"))
 
 DATA_FOLDER = f"data_{WORKER_ID}"
 PROGRESS_FILE = f"progress/worker_{WORKER_ID}.json"
-
-
-# ==========================================================
-# WORKER RANGE
-# ==========================================================
-
-def worker_range():
-
-    start = (WORKER_ID - 1) * ROWS_PER_WORKER
-    end = WORKER_ID * ROWS_PER_WORKER
-
-    return start, end
 
 
 # ==========================================================
@@ -92,10 +80,10 @@ def save_progress(api, token, last_index, shard_index):
 
 
 # ==========================================================
-# DOWNLOAD
+# DOWNLOAD CHUNK (NO skip)
 # ==========================================================
 
-def download_chunk(start_index, token, limit):
+def download_chunk(limit, token):
 
     ds = load_dataset(
         HF_DATASET,
@@ -104,18 +92,22 @@ def download_chunk(start_index, token, limit):
         token=token,
     )
 
-    ds = ds.skip(start_index)
+    # distribute dataset across workers
+    ds = ds.shard(num_shards=TOTAL_WORKERS, index=WORKER_ID - 1)
 
     texts = []
     count = 0
 
-    for sample in tqdm(ds.take(limit), total=limit):
+    for sample in tqdm(ds):
 
         text = sample.get(HF_TEXT_KEY, "")
 
         if text:
             texts.append(text.strip())
             count += 1
+
+        if count >= limit:
+            break
 
     return texts, count
 
@@ -157,7 +149,7 @@ def tokenize_texts(texts):
 
 
 # ==========================================================
-# UPLOAD
+# UPLOAD SHARD
 # ==========================================================
 
 def upload_shard(arr, shard_index, api, token):
@@ -200,24 +192,17 @@ def main():
 
     last_index, shard_index = load_progress(api, hf_token)
 
-    worker_start, worker_end = worker_range()
-
     print(f"Worker {WORKER_ID}")
-    print(f"Worker range: {worker_start} → {worker_end}")
-    print(f"Current index: {last_index}")
+    print(f"Current shard: {shard_index}")
 
-    if last_index >= worker_end:
+    if shard_index >= SHARDS_PER_WORKER:
 
-        print("Worker completed assigned range. Exiting.")
+        print("Worker completed assigned shards. Exiting.")
         return
-
-    remaining = worker_end - last_index
-
-    limit = min(ROWS_PER_RUN, remaining)
 
     print("Downloading chunk...")
 
-    texts, downloaded = download_chunk(last_index, hf_token, limit)
+    texts, downloaded = download_chunk(ROWS_PER_RUN, hf_token)
 
     if downloaded == 0:
 
