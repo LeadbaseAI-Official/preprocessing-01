@@ -33,7 +33,7 @@ SPLIT_DOC = True
 # WORKER CONFIG
 # ==========================================================
 
-WORKER_ID = int(os.getenv("WORKER_ID", "1"))
+WORKER_ID = 1
 
 DATA_FOLDER = f"data_{WORKER_ID}"
 PROGRESS_FILE = f"progress/worker_{WORKER_ID}.json"
@@ -246,3 +246,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
