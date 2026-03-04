@@ -1,17 +1,3 @@
-"""
-Incremental FineWeb → Tokenize → Push (CI Safe)
-
-State stored on HuggingFace:
-    progress.json
-
-Each run:
-    1. Reads progress.json
-    2. Downloads next chunk
-    3. Tokenizes
-    4. Uploads new shard parquet
-    5. Updates progress.json
-"""
-
 import os
 import json
 import numpy as np
@@ -30,7 +16,10 @@ from huggingface_hub import HfApi, hf_hub_download
 HF_DATASET = "HuggingFaceFW/fineweb"
 HF_TEXT_KEY = "text"
 
-ROWS_PER_RUN = 350_000   # Safe for CI
+ROWS_PER_RUN = 350_000
+SHARDS_PER_WORKER = 200
+
+ROWS_PER_WORKER = ROWS_PER_RUN * SHARDS_PER_WORKER
 
 TOKENIZER_PATH = "tokenizer.model"
 HF_REPO_ID = "anisoleai/fineweb-tokenized"
@@ -41,23 +30,44 @@ SPLIT_DOC = True
 
 
 # ==========================================================
-# PROGRESS HANDLING
+# WORKER CONFIG
+# ==========================================================
+
+WORKER_ID = int(os.getenv("WORKER_ID", "1"))
+
+DATA_FOLDER = f"data_{WORKER_ID}"
+PROGRESS_FILE = f"progress/worker_{WORKER_ID}.json"
+
+
+# ==========================================================
+# WORKER RANGE
+# ==========================================================
+
+def worker_range():
+
+    start = (WORKER_ID - 1) * ROWS_PER_WORKER
+    end = WORKER_ID * ROWS_PER_WORKER
+
+    return start, end
+
+
+# ==========================================================
+# PROGRESS
 # ==========================================================
 
 def load_progress(api, token):
 
-    try:
-        path = hf_hub_download(
-            repo_id=HF_REPO_ID,
-            filename="progress.json",
-            repo_type="dataset",
-            token=token,
-        )
-        with open(path, "r") as f:
-            data = json.load(f)
-            return data.get("last_index", 0), data.get("shard_index", 1)
-    except Exception:
-        return 0, 1
+    path = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=PROGRESS_FILE,
+        repo_type="dataset",
+        token=token,
+    )
+
+    with open(path) as f:
+        data = json.load(f)
+
+    return data["last_index"], data["shard_index"]
 
 
 def save_progress(api, token, last_index, shard_index):
@@ -67,12 +77,14 @@ def save_progress(api, token, last_index, shard_index):
         "shard_index": shard_index
     }
 
-    with open("progress.json", "w") as f:
+    local = f"worker_{WORKER_ID}.json"
+
+    with open(local, "w") as f:
         json.dump(progress, f)
 
     api.upload_file(
-        path_or_fileobj="progress.json",
-        path_in_repo="progress.json",
+        path_or_fileobj=local,
+        path_in_repo=PROGRESS_FILE,
         repo_id=HF_REPO_ID,
         repo_type="dataset",
         token=token,
@@ -80,10 +92,10 @@ def save_progress(api, token, last_index, shard_index):
 
 
 # ==========================================================
-# DOWNLOAD NEXT CHUNK
+# DOWNLOAD
 # ==========================================================
 
-def download_chunk(start_index, token):
+def download_chunk(start_index, token, limit):
 
     ds = load_dataset(
         HF_DATASET,
@@ -97,8 +109,10 @@ def download_chunk(start_index, token):
     texts = []
     count = 0
 
-    for sample in tqdm(ds.take(ROWS_PER_RUN), total=ROWS_PER_RUN):
+    for sample in tqdm(ds.take(limit), total=limit):
+
         text = sample.get(HF_TEXT_KEY, "")
+
         if text:
             texts.append(text.strip())
             count += 1
@@ -123,6 +137,7 @@ def tokenize_texts(texts):
     all_tokens = []
 
     for doc in tqdm(texts):
+
         if len(doc) < MIN_DOC_CHARS:
             continue
 
@@ -142,7 +157,7 @@ def tokenize_texts(texts):
 
 
 # ==========================================================
-# UPLOAD SHARD
+# UPLOAD
 # ==========================================================
 
 def upload_shard(arr, shard_index, api, token):
@@ -153,7 +168,7 @@ def upload_shard(arr, shard_index, api, token):
 
     table = pa.table({"token_ids": pa.array(arr, type=pa.uint16())})
 
-    shard_name = f"data/shard-{shard_index:05d}.parquet"
+    shard_name = f"{DATA_FOLDER}/shard-{shard_index:05d}.parquet"
 
     pq.write_table(table, "temp.parquet")
 
@@ -165,7 +180,7 @@ def upload_shard(arr, shard_index, api, token):
         token=token,
     )
 
-    print(f"Uploaded shard {shard_index}")
+    print(f"Uploaded {shard_name}")
 
 
 # ==========================================================
@@ -175,31 +190,50 @@ def upload_shard(arr, shard_index, api, token):
 def main():
 
     hf_token = os.getenv("HF_TOKEN")
+
     if not hf_token:
         raise EnvironmentError("HF_TOKEN not set")
 
     api = HfApi()
 
     print("Loading progress...")
+
     last_index, shard_index = load_progress(api, hf_token)
 
-    print(f"Resuming from index: {last_index}")
-    print(f"Next shard index: {shard_index}")
+    worker_start, worker_end = worker_range()
 
-    print("Downloading next chunk...")
-    texts, downloaded = download_chunk(last_index, hf_token)
+    print(f"Worker {WORKER_ID}")
+    print(f"Worker range: {worker_start} → {worker_end}")
+    print(f"Current index: {last_index}")
+
+    if last_index >= worker_end:
+
+        print("Worker completed assigned range. Exiting.")
+        return
+
+    remaining = worker_end - last_index
+
+    limit = min(ROWS_PER_RUN, remaining)
+
+    print("Downloading chunk...")
+
+    texts, downloaded = download_chunk(last_index, hf_token, limit)
 
     if downloaded == 0:
-        print("No new data available.")
+
+        print("No new data.")
         return
 
     print("Tokenizing...")
+
     arr = tokenize_texts(texts)
 
     print("Uploading shard...")
+
     upload_shard(arr, shard_index, api, hf_token)
 
     print("Updating progress...")
+
     save_progress(
         api,
         hf_token,
@@ -212,6 +246,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
