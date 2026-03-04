@@ -17,9 +17,9 @@ HF_DATASET = "HuggingFaceFW/fineweb"
 HF_TEXT_KEY = "text"
 
 ROWS_PER_RUN = 350_000
-SHARDS_PER_WORKER = 200
+SHARDS_PER_WORKER = 1500
 
-ROWS_PER_WORKER = ROWS_PER_RUN * SHARDS_PER_WORKER
+ROWS_PER_WORKER = ROWS_PER_RUN * SHARDS_PER_WORKER  # 525M rows per worker
 
 TOKENIZER_PATH = "tokenizer.model"
 HF_REPO_ID = "anisoleai/fineweb-tokenized"
@@ -33,7 +33,7 @@ SPLIT_DOC = True
 # WORKER CONFIG
 # ==========================================================
 
-WORKER_ID = 1
+WORKER_ID = int(os.getenv("WORKER_ID", "1"))
 
 DATA_FOLDER = f"data_{WORKER_ID}"
 PROGRESS_FILE = f"progress/worker_{WORKER_ID}.json"
@@ -246,4 +246,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
